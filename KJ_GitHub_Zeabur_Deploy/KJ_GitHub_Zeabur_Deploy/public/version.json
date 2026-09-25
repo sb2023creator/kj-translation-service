@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.0.2",
   "company": "KEJAPJUDI",
   "languages": [
     "en",
@@ -9,6 +9,6 @@
     "th",
     "bn"
   ],
-  "keys_per_language": 835,
-  "updated_at": "2026-09-25T12:09:21.933447+00:00"
+  "keys_per_language": 4450,
+  "updated_at": "2026-09-25T21:17:01.376982+00:00"
 }
