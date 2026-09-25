@@ -1,0 +1,143 @@
+{
+  "source_entries": 835,
+  "keys_per_language": {
+    "en": 835,
+    "ms": 835,
+    "zh": 835,
+    "vi": 835,
+    "th": 835,
+    "bn": 835
+  },
+  "missing_source_keys": [],
+  "extra_source_keys": [],
+  "empty_values": 0,
+  "untranslated_review": "identifiers and dynamic values intentionally retained; details in SOURCE_COVERAGE.json",
+  "numeric_mismatches": [],
+  "numeric_wording_exceptions": [
+    {
+      "key": "1st Prize",
+      "language": "ms"
+    },
+    {
+      "key": "1st Prize",
+      "language": "zh"
+    },
+    {
+      "key": "1st Prize",
+      "language": "vi"
+    },
+    {
+      "key": "1st Prize",
+      "language": "th"
+    },
+    {
+      "key": "1st Prize",
+      "language": "bn"
+    },
+    {
+      "key": "2nd Prize",
+      "language": "ms"
+    },
+    {
+      "key": "2nd Prize",
+      "language": "zh"
+    },
+    {
+      "key": "2nd Prize",
+      "language": "vi"
+    },
+    {
+      "key": "2nd Prize",
+      "language": "th"
+    },
+    {
+      "key": "2nd Prize",
+      "language": "bn"
+    },
+    {
+      "key": "3rd Prize",
+      "language": "ms"
+    },
+    {
+      "key": "3rd Prize",
+      "language": "zh"
+    },
+    {
+      "key": "3rd Prize",
+      "language": "vi"
+    },
+    {
+      "key": "3rd Prize",
+      "language": "th"
+    },
+    {
+      "key": "3rd Prize",
+      "language": "bn"
+    },
+    {
+      "key": "DOWNLINE 1st DEPOSIT",
+      "language": "ms"
+    },
+    {
+      "key": "DOWNLINE 1ST DEPOSIT",
+      "language": "ms"
+    },
+    {
+      "key": "1 Nama Claim 1 ID Sahaja, 1 Member Claim 1 ID Only",
+      "language": "en"
+    },
+    {
+      "key": "1 Nama Claim 1 ID Sahaja, 1 Member Claim 1 ID Only",
+      "language": "zh"
+    },
+    {
+      "key": "1 Nama Claim 1 ID Sahaja, 1 Member Claim 1 ID Only",
+      "language": "vi"
+    },
+    {
+      "key": "1 Nama Claim 1 ID Sahaja, 1 Member Claim 1 ID Only",
+      "language": "th"
+    },
+    {
+      "key": "1 Nama Claim 1 ID Sahaja, 1 Member Claim 1 ID Only",
+      "language": "bn"
+    },
+    {
+      "key": "TNG & BOOST WALLET 1st Cuci Perlu Hantar IC Verify Dahulu ( Pertama Kali Cuci Sahaja )",
+      "language": "en"
+    },
+    {
+      "key": "TNG & BOOST WALLET 1st Cuci Perlu Hantar IC Verify Dahulu ( Pertama Kali Cuci Sahaja )",
+      "language": "ms"
+    },
+    {
+      "key": "TNG & BOOST WALLET 1st Cuci Perlu Hantar IC Verify Dahulu ( Pertama Kali Cuci Sahaja )",
+      "language": "zh"
+    },
+    {
+      "key": "TNG & BOOST WALLET 1st Cuci Perlu Hantar IC Verify Dahulu ( Pertama Kali Cuci Sahaja )",
+      "language": "vi"
+    },
+    {
+      "key": "TNG & BOOST WALLET 1st Cuci Perlu Hantar IC Verify Dahulu ( Pertama Kali Cuci Sahaja )",
+      "language": "th"
+    },
+    {
+      "key": "TNG & BOOST WALLET 1st Cuci Perlu Hantar IC Verify Dahulu ( Pertama Kali Cuci Sahaja )",
+      "language": "bn"
+    }
+  ],
+  "introduced_other_company_brands": [],
+  "normalized_key_conflicts": 0,
+  "live_site_tested": false,
+  "native_language_review": false,
+  "loader_checks": {
+    "javascript_syntax": "passed",
+    "six_language_mock_load": "passed",
+    "cache_isolation": "passed",
+    "cache_reuse": "passed",
+    "rapid_language_switch": "passed",
+    "bo_reset_merge": "passed",
+    "offline_cache": "passed"
+  }
+}

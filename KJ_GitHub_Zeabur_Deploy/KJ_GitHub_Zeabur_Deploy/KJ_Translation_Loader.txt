@@ -1,0 +1,1177 @@
+/* 使用前核对 SERVICE_URL：当前填写的是建议域名 kj-translation-service.zeabur.app，尚未绑定或验证。若实际域名不同，只修改该项。 */
+/* =========================================================
+   KJ Translation Loader — Independent Service v1.0.0
+   Purpose:
+   - Download only the active language JSON
+   - Version check on every fresh website start
+   - Cache-bust version.json and changed language packages
+   - Browser cache with cache-version isolation
+   - Retry / timeout / fallback
+   - Merge into the existing BO TRANSLATE object
+   - Detect language changes and translate matching page text
+
+   Native JavaScript only.
+   No database. No credentials.
+   ========================================================= */
+(function () {
+  'use strict';
+
+  if (window.KJTranslationLoader && window.KJTranslationLoader.__installed) {
+    return;
+  }
+
+  var CONFIG = {
+    SERVICE_URL: 'https://kj-translation-service.zeabur.app',
+    CACHE_VERSION: 'kj_v1',
+    LANGUAGES: ['EN', 'MS', 'ZH', 'VI', 'TH', 'BN'],
+    DEFAULT_LANGUAGE: 'EN',
+    REQUEST_TIMEOUT: 5000,
+    RETRY_DELAY: 2000,
+    MAX_ATTEMPTS: 3,
+    LANGUAGE_POLL_INTERVAL: 500,
+    DEBUG: false
+  };
+
+  var STORAGE = {
+    CACHE: 'kj_translation_cache_' + CONFIG.CACHE_VERSION,
+    VERSION: 'kj_translation_version_' + CONFIG.CACHE_VERSION,
+    LANGUAGE: 'kj_translation_language_' + CONFIG.CACHE_VERSION,
+    UPDATED_AT: 'kj_translation_updated_at_' + CONFIG.CACHE_VERSION,
+    VERSION_CHECKED_AT: 'kj_translation_version_checked_at_' + CONFIG.CACHE_VERSION
+  };
+
+  var state = {
+    initialized: false,
+    currentLanguage: null,
+    requestId: 0,
+    retryAfter: 0,
+    failedLanguage: null,
+    lastRenderedByNode: new WeakMap(),
+    loadingLanguage: null,
+    loadingPromise: null,
+    watcherTimer: null,
+    observer: null,
+    originalKeyByNode: typeof WeakMap !== 'undefined' ? new WeakMap() : null,
+    renderTimer: null,
+    pendingRoots: [],
+    pendingRootSet: typeof WeakSet !== 'undefined' ? new WeakSet() : null,
+    observerFlushTimer: null,
+    keyIndex: Object.create(null),
+    reverseIndex: Object.create(null),
+    translatingNodes: typeof WeakSet !== 'undefined' ? new WeakSet() : null,
+    activeData: null,
+    activeDataLanguage: null,
+    lastTranslateObject: null,
+    mergeRetryTimer: null,
+    lastIntegrityCheck: 0
+  };
+
+  function log() {
+    if (!CONFIG.DEBUG || !window.console || typeof console.log !== 'function') return;
+    var args = Array.prototype.slice.call(arguments);
+    args.unshift('[KJ Translation]');
+    console.log.apply(console, args);
+  }
+
+  function warn() {
+    if (!window.console || typeof console.warn !== 'function') return;
+    var args = Array.prototype.slice.call(arguments);
+    args.unshift('[KJ Translation]');
+    console.warn.apply(console, args);
+  }
+
+  function storageGet(key) {
+    try {
+      return localStorage.getItem(key);
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function storageSet(key, value) {
+    try {
+      localStorage.setItem(key, value);
+      return true;
+    } catch (error) {
+      warn('localStorage write failed:', key);
+      return false;
+    }
+  }
+
+  function parseJson(value, fallback) {
+    try {
+      return value ? JSON.parse(value) : fallback;
+    } catch (error) {
+      return fallback;
+    }
+  }
+
+  function normalizeLanguage(value) {
+    var language = String(value || '')
+      .replace(/["']/g, '')
+      .trim()
+      .replace('-', '_')
+      .toUpperCase();
+
+    if (language === 'VN') language = 'VI';
+    if (language.indexOf('_') !== -1) language = language.split('_')[0];
+
+    return CONFIG.LANGUAGES.indexOf(language) !== -1
+      ? language
+      : CONFIG.DEFAULT_LANGUAGE;
+  }
+
+  function detectLanguage() {
+    var candidates = [
+      storageGet('LANGUAGE'),
+      storageGet('language'),
+      window.LANGUAGE,
+      window.currentLanguage,
+      document.documentElement
+        ? document.documentElement.getAttribute('lang')
+        : null
+    ];
+
+    for (var i = 0; i < candidates.length; i += 1) {
+      if (candidates[i]) return normalizeLanguage(candidates[i]);
+    }
+
+    return CONFIG.DEFAULT_LANGUAGE;
+  }
+
+  function getCacheStore() {
+    var store = parseJson(storageGet(STORAGE.CACHE), {});
+    return store && typeof store === 'object' && !Array.isArray(store)
+      ? store
+      : {};
+  }
+
+  function getCachedLanguage(language) {
+    var entry = getCacheStore()[language];
+
+    if (!entry || typeof entry !== 'object') return null;
+    if (!entry.data || typeof entry.data !== 'object' || Array.isArray(entry.data)) {
+      return null;
+    }
+
+    return entry;
+  }
+
+  function saveCachedLanguage(language, versionInfo, data) {
+    var store = getCacheStore();
+
+    store[language] = {
+      version: String(versionInfo.version),
+      updated_at: String(versionInfo.updated_at || ''),
+      cached_at: new Date().toISOString(),
+      data: data
+    };
+
+    storageSet(STORAGE.CACHE, JSON.stringify(store));
+    storageSet(STORAGE.VERSION, String(versionInfo.version));
+    storageSet(STORAGE.LANGUAGE, language);
+    storageSet(STORAGE.UPDATED_AT, String(versionInfo.updated_at || ''));
+  }
+
+  function fetchJsonOnce(url) {
+    var controller =
+      typeof AbortController !== 'undefined'
+        ? new AbortController()
+        : null;
+
+    var timeoutId = setTimeout(function () {
+      if (controller) controller.abort();
+    }, CONFIG.REQUEST_TIMEOUT);
+
+    var options = {
+      method: 'GET',
+      mode: 'cors',
+      credentials: 'omit',
+      cache: 'no-store',
+      headers: {
+        Accept: 'application/json'
+      }
+    };
+
+    if (controller) options.signal = controller.signal;
+
+    return fetch(url, options)
+      .then(function (response) {
+        if (!response.ok) {
+          throw new Error('HTTP ' + response.status);
+        }
+
+        return response.text();
+      })
+      .then(function (text) {
+        try {
+          return JSON.parse(text);
+        } catch (error) {
+          throw new Error('Invalid JSON');
+        }
+      })
+      .finally(function () {
+        clearTimeout(timeoutId);
+      });
+  }
+
+  function fetchJsonWithRetry(url, label) {
+    var attempt = 0;
+
+    function run() {
+      attempt += 1;
+
+      return fetchJsonOnce(url).catch(function (error) {
+        var message =
+          error && error.name === 'AbortError'
+            ? 'Timeout after ' + CONFIG.REQUEST_TIMEOUT + 'ms'
+            : (error && error.message) || 'Network error';
+
+        warn(
+          label +
+            ' attempt ' +
+            attempt +
+            '/' +
+            CONFIG.MAX_ATTEMPTS +
+            ' failed:',
+          message
+        );
+
+        if (attempt >= CONFIG.MAX_ATTEMPTS) {
+          throw error;
+        }
+
+        return new Promise(function (resolve) {
+          setTimeout(resolve, CONFIG.RETRY_DELAY);
+        }).then(run);
+      });
+    }
+
+    return run();
+  }
+
+  function shouldCheckVersion() {
+    /*
+      Stage 3 rule:
+      Check version.json once on every website start.
+      The language JSON is downloaded only when its cached version differs.
+    */
+    return true;
+  }
+
+  function buildFreshUrl(url, value) {
+    var separator = url.indexOf('?') === -1 ? '?' : '&';
+    return url + separator + '_kjv=' + encodeURIComponent(String(value || Date.now()));
+  }
+
+  function getVersionInfo() {
+    /*
+      Always bypass browser/CDN cache for version.json.
+      This guarantees every fresh website start checks the currently deployed version.
+    */
+    var versionUrl = buildFreshUrl(
+      CONFIG.SERVICE_URL + '/version.json',
+      Date.now()
+    );
+
+    return fetchJsonWithRetry(
+      versionUrl,
+      'version.json'
+    ).then(function (payload) {
+      if (
+        !payload ||
+        typeof payload !== 'object' ||
+        !String(payload.version || '').trim()
+      ) {
+        throw new Error('Invalid version.json structure');
+      }
+
+      storageSet(
+        STORAGE.VERSION_CHECKED_AT,
+        String(Date.now())
+      );
+
+      return {
+        version: String(payload.version),
+        updated_at: String(payload.updated_at || ''),
+        source: 'network'
+      };
+    });
+  }
+
+  function getBOTranslateObject() {
+    return (
+      window.TRANSLATE &&
+      typeof window.TRANSLATE === 'object'
+    )
+      ? window.TRANSLATE
+      : null;
+  }
+
+  function mergeIntoBO(language, data) {
+    var translateObject = getBOTranslateObject();
+
+    if (!translateObject) {
+      return false;
+    }
+
+    Object.keys(data).forEach(function (rawKey) {
+      var key = String(rawKey || '')
+        .trim()
+        .toLowerCase();
+
+      if (!key || key === '__proto__' || key === 'constructor' || key === 'prototype') return;
+
+      if (
+        !translateObject[key] ||
+        typeof translateObject[key] !== 'object'
+      ) {
+        translateObject[key] = {};
+      }
+
+      translateObject[key][language] = data[rawKey];
+    });
+
+    state.lastTranslateObject = translateObject;
+    buildTranslationIndex();
+    return true;
+  }
+
+  function applyActiveData(reason) {
+    if (
+      !state.activeData ||
+      !state.activeDataLanguage
+    ) {
+      return false;
+    }
+
+    var merged = mergeIntoBO(
+      state.activeDataLanguage,
+      state.activeData
+    );
+
+    if (!merged) {
+      if (!state.mergeRetryTimer) {
+        state.mergeRetryTimer = setTimeout(function () {
+          state.mergeRetryTimer = null;
+          applyActiveData('bo-ready-retry');
+        }, 100);
+      }
+
+      return false;
+    }
+
+    renderCurrentPage(state.activeDataLanguage);
+
+    setTimeout(function () {
+      renderCurrentPage(state.activeDataLanguage);
+    }, 300);
+
+    log(
+      'Merged into BO:',
+      state.activeDataLanguage,
+      'reason:',
+      reason || 'unknown'
+    );
+
+    return true;
+  }
+
+
+
+
+  function isActiveDataMerged() {
+    var translateObject = getBOTranslateObject();
+
+    if (
+      !translateObject ||
+      !state.activeData ||
+      !state.activeDataLanguage
+    ) {
+      return false;
+    }
+
+    var rawKeys = Object.keys(state.activeData);
+
+    if (!rawKeys.length) return false;
+
+    /*
+      Check several keys across the package instead of only checking
+      whether the TRANSLATE object reference changed. Some BO builds
+      clear and rebuild the same object in place.
+    */
+    var positions = [
+      0,
+      Math.floor(rawKeys.length / 3),
+      Math.floor((rawKeys.length * 2) / 3),
+      rawKeys.length - 1
+    ];
+
+    for (var i = 0; i < positions.length; i += 1) {
+      var rawKey = rawKeys[positions[i]];
+      var key = String(rawKey || '')
+        .trim()
+        .toLowerCase();
+
+      var entry = translateObject[key];
+
+      if (
+        !entry ||
+        typeof entry !== 'object' ||
+        entry[state.activeDataLanguage] !== state.activeData[rawKey]
+      ) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  function normalizeText(value) {
+    return String(value || '')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .toLowerCase();
+  }
+
+  function buildTranslationIndex() {
+    state.keyIndex = Object.create(null);
+    state.reverseIndex = Object.create(null);
+
+    if (!window.TRANSLATE || typeof window.TRANSLATE !== 'object') {
+      return;
+    }
+
+    var keys = Object.keys(window.TRANSLATE);
+
+    for (var i = 0; i < keys.length; i += 1) {
+      var key = keys[i];
+      var normalizedKey = normalizeText(key);
+      var entry = window.TRANSLATE[key];
+
+      if (!normalizedKey || !entry || typeof entry !== 'object') {
+        continue;
+      }
+
+      state.keyIndex[normalizedKey] = key;
+
+      var languages = Object.keys(entry);
+
+      for (var j = 0; j < languages.length; j += 1) {
+        var translatedValue = entry[languages[j]];
+
+        if (typeof translatedValue !== 'string') continue;
+
+        var normalizedValue = normalizeText(translatedValue);
+
+        if (normalizedValue && !state.reverseIndex[normalizedValue]) {
+          state.reverseIndex[normalizedValue] = key;
+        }
+      }
+    }
+  }
+
+  function shouldSkipElement(element) {
+    if (!element || element.nodeType !== 1) return false;
+
+    if (element.closest && element.closest('script,style,noscript,textarea,option,pre,code,[contenteditable]:not([contenteditable="false"]),[translate="no"],.notranslate,.vc-balance,.material-icons,.material-symbols-outlined')) return true;
+    var tag = element.nodeName;
+    if (
+      tag === 'SCRIPT' ||
+      tag === 'STYLE' ||
+      tag === 'NOSCRIPT' ||
+      tag === 'TEXTAREA' ||
+      tag === 'OPTION'
+    ) {
+      return true;
+    }
+
+    if (
+      element.classList &&
+      (
+        element.classList.contains('vc-balance') ||
+        element.classList.contains('notranslate')
+      )
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  function findTranslationKey(visibleText) {
+    var normalized = normalizeText(visibleText);
+
+    if (!normalized) return null;
+
+    return (
+      state.keyIndex[normalized] ||
+      state.reverseIndex[normalized] ||
+      null
+    );
+  }
+
+  function translateTextNode(node, language) {
+    if (!node || node.nodeType !== 3 || !node.parentElement) return;
+    if (shouldSkipElement(node.parentElement)) return;
+
+    var currentValue = node.nodeValue || '';
+    var visibleText = currentValue.trim();
+
+    if (!visibleText) return;
+
+    if (state.lastRenderedByNode.has(node) && state.lastRenderedByNode.get(node) !== currentValue) {
+      state.originalKeyByNode.delete(node);
+    }
+
+    var key =
+      state.originalKeyByNode &&
+      state.originalKeyByNode.get(node);
+
+    if (!key) {
+      key = findTranslationKey(visibleText);
+
+      if (!key) {
+        var strippedText = visibleText
+          .replace(/^[\s•·|:：\-–—]+/, '')
+          .replace(/[\s•·|:：\-–—]+$/, '');
+
+        if (strippedText !== visibleText) {
+          key = findTranslationKey(strippedText);
+        }
+      }
+
+      if (!key) return;
+
+      if (state.originalKeyByNode) {
+        state.originalKeyByNode.set(node, key);
+      }
+    }
+
+    var entry = window.TRANSLATE && window.TRANSLATE[key];
+    var translated =
+      entry &&
+      typeof entry === 'object' &&
+      typeof entry[language] === 'string'
+        ? entry[language]
+        : null;
+
+    if (!translated || translated === visibleText) return;
+
+    if (state.translatingNodes) {
+      state.translatingNodes.add(node);
+    }
+
+    node.nodeValue = currentValue.replace(
+      visibleText,
+      function () { return translated; }
+    );
+    state.lastRenderedByNode.set(node, node.nodeValue);
+
+    if (state.translatingNodes) {
+      setTimeout(function () {
+        state.translatingNodes.delete(node);
+      }, 0);
+    }
+  }
+
+  function translateAttributes(element, language) {
+    if (!element || element.nodeType !== 1 || shouldSkipElement(element)) return;
+
+    var attributes = ['placeholder', 'title', 'aria-label'];
+
+    for (var i = 0; i < attributes.length; i += 1) {
+      var attribute = attributes[i];
+      var currentValue = element.getAttribute(attribute);
+
+      if (!currentValue) continue;
+
+      var key = findTranslationKey(currentValue);
+      if (!key) continue;
+
+      var entry = window.TRANSLATE[key];
+      var translated =
+        entry &&
+        typeof entry[language] === 'string'
+          ? entry[language]
+          : null;
+
+      if (translated && translated !== currentValue) {
+        element.setAttribute(attribute, translated);
+      }
+    }
+  }
+
+  function translateTree(root, language) {
+    if (!root) return;
+
+    if (root.nodeType === 3) {
+      translateTextNode(root, language);
+      return;
+    }
+
+    if (root.nodeType !== 1 || shouldSkipElement(root)) return;
+
+    translateAttributes(root, language);
+
+    var elements = root.querySelectorAll
+      ? root.querySelectorAll('[placeholder],[title],[aria-label]')
+      : [];
+
+    for (var e = 0; e < elements.length; e += 1) {
+      translateAttributes(elements[e], language);
+    }
+
+    var walker = document.createTreeWalker(
+      root,
+      NodeFilter.SHOW_TEXT,
+      null,
+      false
+    );
+
+    var nodes = [];
+    var node;
+
+    while ((node = walker.nextNode())) {
+      nodes.push(node);
+    }
+
+    for (var i = 0; i < nodes.length; i += 1) {
+      translateTextNode(nodes[i], language);
+    }
+  }
+
+  function renderCurrentPage(language) {
+    if (!document.body) return;
+
+    if (state.renderTimer) {
+      clearTimeout(state.renderTimer);
+    }
+
+    state.renderTimer = setTimeout(function () {
+      state.renderTimer = null;
+
+      window.requestAnimationFrame(function () {
+        translateTree(document.body, language);
+        updateSpecialComponents(language);
+
+        if (typeof window.updateLiveTxTitle === 'function') {
+          try {
+            window.updateLiveTxTitle(language);
+          } catch (error) {
+            warn(
+              'updateLiveTxTitle warning:',
+              error && error.message
+            );
+          }
+        }
+      });
+    }, 0);
+  }
+
+
+  function updateSpecialComponents(language) {
+    if (!window.TRANSLATE) return;
+
+    var liveTitleEntry =
+      window.TRANSLATE['kejapjudi live transaction'];
+    var liveListEntry =
+      window.TRANSLATE['live transaction'];
+
+    var liveTitle =
+      liveTitleEntry &&
+      typeof liveTitleEntry[language] === 'string'
+        ? liveTitleEntry[language]
+        : null;
+
+    var liveList =
+      liveListEntry &&
+      typeof liveListEntry[language] === 'string'
+        ? liveListEntry[language]
+        : null;
+
+    if (liveTitle) {
+      var currentCssTitle = getComputedStyle(
+        document.documentElement
+      )
+        .getPropertyValue('--livetx-title')
+        .trim()
+        .replace(/^["']|["']$/g, '');
+
+      if (currentCssTitle !== liveTitle) {
+        document.documentElement.style.setProperty(
+          '--livetx-title',
+          '"' + liveTitle.replace(/"/g, '\\"') + '"'
+        );
+      }
+    }
+
+    var listTypeElement = document.querySelector(
+      '#home-livetx .list-type'
+    );
+
+    if (
+      listTypeElement &&
+      liveList &&
+      listTypeElement.textContent.trim() !== liveList
+    ) {
+      listTypeElement.textContent = liveList;
+    }
+  }
+
+  function queueRootForTranslation(root) {
+    if (!root) return;
+
+    if (
+      root.nodeType === 1 &&
+      state.pendingRootSet &&
+      state.pendingRootSet.has(root)
+    ) {
+      return;
+    }
+
+    if (root.nodeType === 1 && state.pendingRootSet) {
+      state.pendingRootSet.add(root);
+    }
+
+    state.pendingRoots.push(root);
+
+    if (state.observerFlushTimer) return;
+
+    state.observerFlushTimer = setTimeout(function () {
+      state.observerFlushTimer = null;
+
+      var roots = state.pendingRoots.splice(0);
+      state.pendingRootSet =
+        typeof WeakSet !== 'undefined'
+          ? new WeakSet()
+          : null;
+
+      var language =
+        state.currentLanguage || detectLanguage();
+
+      var index = 0;
+
+      function processBatch(deadline) {
+        var startedAt = Date.now();
+
+        while (index < roots.length) {
+          translateTree(roots[index], language);
+          index += 1;
+
+          if (
+            deadline &&
+            typeof deadline.timeRemaining === 'function' &&
+            deadline.timeRemaining() < 4
+          ) {
+            break;
+          }
+
+          if (!deadline && Date.now() - startedAt > 8) {
+            break;
+          }
+        }
+
+        if (index < roots.length) {
+          if (typeof window.requestIdleCallback === 'function') {
+            window.requestIdleCallback(processBatch, { timeout: 120 });
+          } else {
+            setTimeout(processBatch, 16);
+          }
+        }
+      }
+
+      if (typeof window.requestIdleCallback === 'function') {
+        window.requestIdleCallback(processBatch, { timeout: 120 });
+      } else {
+        setTimeout(processBatch, 0);
+      }
+    }, 40);
+  }
+
+  function startSafeObserver() {
+    if (
+      state.observer ||
+      !window.MutationObserver ||
+      !document.body
+    ) {
+      return;
+    }
+
+    state.observer = new MutationObserver(function (mutations) {
+      var shouldRefreshSpecialComponents = false;
+
+      for (var i = 0; i < mutations.length; i += 1) {
+        var mutation = mutations[i];
+
+        if (mutation.type === 'characterData') {
+          if (
+            state.translatingNodes &&
+            state.translatingNodes.has(mutation.target)
+          ) {
+            continue;
+          }
+
+          queueRootForTranslation(mutation.target);
+          continue;
+        }
+
+        if (mutation.type === 'attributes') {
+          queueRootForTranslation(mutation.target);
+          shouldRefreshSpecialComponents = true;
+          continue;
+        }
+
+        var addedNodes = mutation.addedNodes;
+
+        for (var j = 0; j < addedNodes.length; j += 1) {
+          var node = addedNodes[j];
+
+          if (
+            node.nodeType === 1 &&
+            shouldSkipElement(node)
+          ) {
+            continue;
+          }
+
+          queueRootForTranslation(node);
+        }
+
+        if (addedNodes.length) {
+          shouldRefreshSpecialComponents = true;
+        }
+      }
+
+      if (shouldRefreshSpecialComponents) {
+        setTimeout(function () {
+          updateSpecialComponents(
+            state.currentLanguage || detectLanguage()
+          );
+        }, 50);
+      }
+    });
+
+    state.observer.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: [
+        'page',
+        'class',
+        'placeholder',
+        'title',
+        'aria-label'
+      ]
+    });
+  }
+
+  function notifyReady(language, source, reason) {
+    try {
+      window.dispatchEvent(
+        new CustomEvent('kj:translation-ready', {
+          detail: {
+            language: language,
+            source: source,
+            reason: reason || 'initial'
+          }
+        })
+      );
+    } catch (error) {}
+
+    try {
+      document.dispatchEvent(
+        new CustomEvent('kj:translation-ready', {
+          detail: {
+            language: language,
+            source: source,
+            reason: reason || 'initial'
+          }
+        })
+      );
+    } catch (error) {}
+
+    /*
+      Important:
+      Do not call TX() without a key.
+      Merge into BO and render matching text without replacing page markup.
+    */
+  }
+
+  function loadLanguage(language, reason) {
+    language = normalizeLanguage(language);
+
+    if (
+      state.loadingPromise &&
+      state.loadingLanguage === language
+    ) {
+      return state.loadingPromise;
+    }
+
+    state.failedLanguage = null;
+    state.retryAfter = 0;
+    var requestId = ++state.requestId;
+    state.loadingLanguage = language;
+
+    state.loadingPromise = getVersionInfo()
+      .then(function (versionInfo) {
+        if (requestId !== state.requestId) return { success: false, source: 'superseded', language: language };
+        var cached = getCachedLanguage(language);
+
+        if (
+          cached &&
+          String(cached.version) === String(versionInfo.version)
+        ) {
+          state.activeData = cached.data;
+          state.activeDataLanguage = language;
+          state.currentLanguage = language;
+          applyActiveData('cache');
+          notifyReady(language, 'cache', reason);
+
+          log(
+            'Ready:',
+            language,
+            'source: cache',
+            'reason:',
+            reason || 'initial'
+          );
+
+          return {
+            success: true,
+            source: 'cache',
+            language: language
+          };
+        }
+
+        var languageUrl = buildFreshUrl(
+          CONFIG.SERVICE_URL +
+            '/translations/' +
+            language.toLowerCase() +
+            '.json',
+          versionInfo.version
+        );
+
+        return fetchJsonWithRetry(
+          languageUrl,
+          language.toLowerCase() + '.json'
+        ).then(function (data) {
+          if (requestId !== state.requestId) return { success: false, source: 'superseded', language: language };
+          if (
+            !data ||
+            typeof data !== 'object' ||
+            Array.isArray(data)
+          ) {
+            throw new Error(
+              'Invalid translation JSON structure'
+            );
+          }
+
+          saveCachedLanguage(
+            language,
+            versionInfo,
+            data
+          );
+
+          state.activeData = data;
+          state.activeDataLanguage = language;
+          state.currentLanguage = language;
+          applyActiveData('network');
+          notifyReady(language, 'network', reason);
+
+          log(
+            'Ready:',
+            language,
+            'source: network',
+            'reason:',
+            reason || 'initial'
+          );
+
+          return {
+            success: true,
+            source: 'network',
+            language: language
+          };
+        });
+      })
+      .catch(function (error) {
+        if (requestId !== state.requestId) return { success: false, source: 'superseded', language: language };
+        var fallback = getCachedLanguage(language);
+
+        if (fallback) {
+          state.activeData = fallback.data;
+          state.activeDataLanguage = language;
+          state.currentLanguage = language;
+          applyActiveData('fallback-cache');
+          notifyReady(
+            language,
+            'fallback-cache',
+            reason
+          );
+
+          warn(
+            'Network/version failed. Browser cache fallback used for',
+            language
+          );
+
+          return {
+            success: true,
+            source: 'fallback-cache',
+            language: language
+          };
+        }
+
+        state.failedLanguage = language;
+        state.retryAfter = Date.now() + 60000;
+        warn(
+          'Translation Load Failed. Cache missing. Website will continue running.'
+        );
+
+        return {
+          success: false,
+          source: 'none',
+          language: language,
+          error: error
+        };
+      })
+      .finally(function () {
+        if (requestId === state.requestId) {
+          state.loadingPromise = null;
+          state.loadingLanguage = null;
+        }
+      });
+
+    return state.loadingPromise;
+  }
+
+  function startLanguageWatcher() {
+    if (state.watcherTimer) return;
+
+    state.watcherTimer = setInterval(function () {
+      var detected = detectLanguage();
+      var currentTranslateObject = getBOTranslateObject();
+
+      if (
+        state.activeData &&
+        currentTranslateObject &&
+        !isActiveDataMerged()
+      ) {
+        applyActiveData('bo-translate-reset');
+      }
+
+      if (
+        detected !== (state.loadingLanguage || state.currentLanguage) &&
+        !(detected === state.failedLanguage && Date.now() < state.retryAfter)
+      ) {
+        loadLanguage(
+          detected,
+          'language-switch'
+        );
+      }
+    }, CONFIG.LANGUAGE_POLL_INTERVAL);
+  }
+
+  function clearCache() {
+    try {
+      localStorage.removeItem(STORAGE.CACHE);
+      localStorage.removeItem(STORAGE.VERSION);
+      localStorage.removeItem(STORAGE.LANGUAGE);
+      localStorage.removeItem(STORAGE.UPDATED_AT);
+      localStorage.removeItem(
+        STORAGE.VERSION_CHECKED_AT
+      );
+
+      log('Translation cache cleared.');
+    } catch (error) {
+      warn('Unable to clear translation cache.');
+    }
+  }
+
+  function init() {
+    if (state.initialized) return;
+    state.initialized = true;
+    /*
+      No waitForBO.
+      Observe page changes and translate dictionary matches.
+      No page-loading dependency.
+    */
+    if (!window.TRANSLATE || typeof window.TRANSLATE !== 'object') {
+      window.TRANSLATE = Object.create(null);
+    }
+    startLanguageWatcher();
+    startSafeObserver();
+    loadLanguage(detectLanguage(), 'initial');
+  }
+
+  window.KJTranslationLoader = {
+    __installed: true,
+    init: init,
+
+    loadLanguage: function (language) {
+      return loadLanguage(language, 'manual');
+    },
+
+    clearCache: clearCache,
+
+    getLanguage: function () {
+      return state.currentLanguage || detectLanguage();
+    },
+
+    forceMerge: function () {
+      return applyActiveData('manual-force');
+    },
+
+    debug: function () {
+      var data = state.activeData || {};
+      var keys = Object.keys(data);
+      var sampleKey = keys.length
+        ? String(keys[0]).trim().toLowerCase()
+        : null;
+
+      return {
+        language: state.currentLanguage || detectLanguage(),
+        activeDataLanguage: state.activeDataLanguage,
+        activeKeyCount: keys.length,
+        cachedVersion: storageGet(STORAGE.VERSION),
+        cachedUpdatedAt: storageGet(STORAGE.UPDATED_AT),
+        sampleKey: sampleKey,
+        sampleDataValue: keys.length ? data[keys[0]] : null,
+        sampleBOEntry:
+          sampleKey && window.TRANSLATE
+            ? window.TRANSLATE[sampleKey]
+            : null,
+        integrityOK: isActiveDataMerged(),
+        hasDepositSuccessfulInPackage:
+          Object.prototype.hasOwnProperty.call(
+            data,
+            'deposit successful'
+          ),
+        depositSuccessfulPackageValue:
+          data['deposit successful'],
+        depositSuccessfulBO:
+          window.TRANSLATE &&
+          window.TRANSLATE['deposit successful']
+      };
+    },
+
+    getCacheKeys: function () {
+      return {
+        cache: STORAGE.CACHE,
+        version: STORAGE.VERSION,
+        language: STORAGE.LANGUAGE,
+        updatedAt: STORAGE.UPDATED_AT,
+        versionCheckedAt:
+          STORAGE.VERSION_CHECKED_AT
+      };
+    }
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener(
+      'DOMContentLoaded',
+      init,
+      { once: true }
+    );
+  } else {
+    init();
+  }
+})();
